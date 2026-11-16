@@ -76,10 +76,10 @@ function formatE164(phone, defaultCountry = 'General') {
   return digits.length >= 9 ? digits : null;
 }
 
-async function startSession(rawId, forceFresh = false) {
+async function startSession(rawId, forceFresh = false, isReconnect = false) {
   const sid = cleanSessionId(rawId);
   const existing = sessions.get(sid);
-  if (!forceFresh && existing && (existing.status === 'connected' || existing.status === 'qr' || existing.status === 'init')) {
+  if (!forceFresh && !isReconnect && existing && (existing.status === 'connected' || existing.status === 'qr' || existing.status === 'init' || existing.status === 'reconnecting')) {
     existing.lastActive = Date.now();
     return existing;
   }
@@ -91,6 +91,8 @@ async function startSession(rawId, forceFresh = false) {
     }
     sessions.delete(sid);
     try { fs.rmSync(sessionFolder, { recursive: true, force: true }); } catch (e) {}
+  } else if (isReconnect && existing?.sock) {
+    try { existing.sock.end(); } catch (e) {}
   }
 
   if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
@@ -141,8 +143,8 @@ async function startSession(rawId, forceFresh = false) {
         const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 401;
         console.log(`[Session ${sid}] Closed (code ${code}), reconnect=${shouldReconnect}`);
         if (shouldReconnect && sessions.has(sid)) {
-          stateObj.status = 'init';
-          setTimeout(() => startSession(sid, false), 1500);
+          stateObj.status = 'reconnecting';
+          setTimeout(() => startSession(sid, false, true), 1000);
         } else {
           stateObj.status = 'closed';
           stateObj.qr = null;
