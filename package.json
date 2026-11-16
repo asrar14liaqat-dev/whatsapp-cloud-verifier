@@ -1,0 +1,19 @@
+{
+  "name": "whatsapp-cloud-verifier",
+  "version": "2.0.0",
+  "description": "Multi-User Cloud WhatsApp Number Verifier Engine (Baileys)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pino": "^9.3.2",
+    "qrcode": "^1.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
