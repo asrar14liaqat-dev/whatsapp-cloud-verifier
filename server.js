@@ -1,16 +1,19 @@
-const express = require('express');
-const cors = require('cors');
-const pino = require('pino');
-const QRCode = require('qrcode');
-const fs = require('fs');
-const path = require('path');
-const {
-  default: makeWASocket,
+import express from 'express';
+import cors from 'cors';
+import pino from 'pino';
+import QRCode from 'qrcode';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers
-} = require('@whiskeysockets/baileys');
+} from '@whiskeysockets/baileys';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors({ origin: '*' }));
@@ -20,8 +23,7 @@ const PORT = process.env.PORT || 7860;
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
-// In-memory store for active visitor sessions
-// sessionId -> { sock, qr, status: 'init'|'qr'|'connected'|'closed', lastActive }
+// sessionId -> { sock, qr, status: 'init'|'qr'|'connected'|'closed', lastActive, phoneMode }
 const sessions = new Map();
 
 function cleanSessionId(id) {
@@ -62,7 +64,6 @@ function formatE164(phone, defaultCountry = 'General') {
     if (digits.length === 10) return '91' + digits;
   }
 
-  // Intelligent Auto-Detect
   if (digits.startsWith('04') && digits.length === 10) return '61' + digits.slice(1);
   if (digits.startsWith('03') && digits.length === 11) return '92' + digits.slice(1);
   if (digits.startsWith('07') && digits.length === 11) return '44' + digits.slice(1);
@@ -75,15 +76,23 @@ function formatE164(phone, defaultCountry = 'General') {
   return digits.length >= 9 ? digits : null;
 }
 
-async function startSession(rawId) {
+async function startSession(rawId, forceFresh = false) {
   const sid = cleanSessionId(rawId);
   const existing = sessions.get(sid);
-  if (existing && (existing.status === 'connected' || existing.status === 'qr' || existing.status === 'init')) {
+  if (!forceFresh && existing && (existing.status === 'connected' || existing.status === 'qr' || existing.status === 'init')) {
     existing.lastActive = Date.now();
     return existing;
   }
 
   const sessionFolder = path.join(SESSIONS_DIR, sid);
+  if (forceFresh) {
+    if (existing?.sock) {
+      try { existing.sock.end(); } catch (e) {}
+    }
+    sessions.delete(sid);
+    try { fs.rmSync(sessionFolder, { recursive: true, force: true }); } catch (e) {}
+  }
+
   if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
 
   const stateObj = {
@@ -98,14 +107,14 @@ async function startSession(rawId) {
   try {
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
     const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`[Session ${sid}] Using WA v${version.join('.')} (isLatest=${isLatest})`);
+    console.log(`[Session ${sid}] Baileys v7 | WA v${version.join('.')} (latest=${isLatest})`);
 
     const sock = makeWASocket({
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: Browsers.macOS('Desktop'),
+      browser: Browsers.ubuntu('Chrome'),
       connectTimeoutMs: 60000,
       defaultQueryTimeoutMs: undefined,
       syncFullHistory: false,
@@ -113,7 +122,6 @@ async function startSession(rawId) {
     });
 
     stateObj.sock = sock;
-
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
@@ -127,14 +135,14 @@ async function startSession(rawId) {
       if (connection === 'open') {
         stateObj.status = 'connected';
         stateObj.qr = null;
-        console.log(`[Session ${sid}] Connected!`);
+        console.log(`[Session ${sid}] Connected successfully!`);
       } else if (connection === 'close') {
         const code = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = code !== DisconnectReason.loggedOut && code !== 401;
         console.log(`[Session ${sid}] Closed (code ${code}), reconnect=${shouldReconnect}`);
         if (shouldReconnect && sessions.has(sid)) {
           stateObj.status = 'init';
-          setTimeout(() => startSession(sid), 1500);
+          setTimeout(() => startSession(sid, false), 1500);
         } else {
           stateObj.status = 'closed';
           stateObj.qr = null;
@@ -144,14 +152,13 @@ async function startSession(rawId) {
       }
     });
   } catch (err) {
-    console.error(`[Session ${sid}] Error:`, err.message);
+    console.error(`[Session ${sid}] Init Error:`, err.message);
     stateObj.status = 'error';
   }
 
   return stateObj;
 }
 
-// Cleanup idle sessions older than 45 mins to save RAM
 setInterval(() => {
   const now = Date.now();
   for (const [sid, s] of sessions.entries()) {
@@ -162,19 +169,18 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// Health Check (keeps Render/Koyeb happy)
 app.get('/', (req, res) => {
   res.json({
-    service: 'WhatsVerifier Pro Cloud Engine',
+    service: 'WhatsVerifier Pro Cloud Engine (v2.1)',
     status: 'online',
     active_sessions: sessions.size
   });
 });
 
-// Start / Get QR for a specific visitor session
 app.get('/api/session/qr', async (req, res) => {
   const sid = cleanSessionId(req.query.sessionId);
-  const s = await startSession(sid);
+  const fresh = req.query.fresh === '1';
+  const s = await startSession(sid, fresh);
   s.lastActive = Date.now();
   res.json({
     sessionId: sid,
@@ -184,7 +190,34 @@ app.get('/api/session/qr', async (req, res) => {
   });
 });
 
-// Check session status
+// 8-Digit Phone Pairing Code (bypasses QR camera/datacenter IP blocks!)
+app.post('/api/session/pair', async (req, res) => {
+  const sid = cleanSessionId(req.body?.sessionId || req.query.sessionId);
+  const rawPhone = String(req.body?.phone || '').replace(/\D/g, '');
+  if (!rawPhone || rawPhone.length < 10) {
+    return res.status(400).json({ error: 'Enter full phone number with country code (e.g. 923001234567)' });
+  }
+
+  try {
+    const s = await startSession(sid, true);
+    // Wait briefly for socket to initialize
+    for (let i = 0; i < 15; i++) {
+      if (s.sock && (s.status === 'qr' || s.status === 'init')) break;
+      await new Promise(r => setTimeout(r, 400));
+    }
+    await new Promise(r => setTimeout(r, 1500));
+
+    if (!s.sock) {
+      return res.status(500).json({ error: 'Socket not ready yet, try again.' });
+    }
+    const code = await s.sock.requestPairingCode(rawPhone);
+    res.json({ sessionId: sid, code, phone: rawPhone });
+  } catch (err) {
+    console.error(`[Session ${sid}] Pair Error:`, err.message);
+    res.status(500).json({ error: 'Could not generate pairing code: ' + err.message });
+  }
+});
+
 app.get('/api/session/status', (req, res) => {
   const sid = cleanSessionId(req.query.sessionId);
   const s = sessions.get(sid);
@@ -200,7 +233,6 @@ app.get('/api/session/status', (req, res) => {
   });
 });
 
-// Disconnect / Logout session
 app.post('/api/session/logout', async (req, res) => {
   const sid = cleanSessionId(req.body?.sessionId || req.query.sessionId);
   const s = sessions.get(sid);
@@ -214,7 +246,6 @@ app.post('/api/session/logout', async (req, res) => {
   res.json({ status: 'logged_out' });
 });
 
-// Verify single OR batch numbers (Ultra-fast via Baileys onWhatsApp)
 app.post('/api/verify', async (req, res) => {
   const sid = cleanSessionId(req.body?.sessionId || req.query.sessionId);
   const country = req.body?.country || 'General';
@@ -223,7 +254,7 @@ app.post('/api/verify', async (req, res) => {
 
   const s = sessions.get(sid);
   if (!s || s.status !== 'connected' || !s.sock) {
-    return res.status(400).json({ error: 'WhatsApp not connected. Please scan QR code first.' });
+    return res.status(400).json({ error: 'WhatsApp not connected. Please link WhatsApp first.' });
   }
   s.lastActive = Date.now();
 
@@ -272,5 +303,5 @@ app.post('/api/verify', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`WhatsVerifier Cloud Engine running on port ${PORT}`);
+  console.log(`WhatsVerifier Cloud Engine v2.1 running on port ${PORT}`);
 });
