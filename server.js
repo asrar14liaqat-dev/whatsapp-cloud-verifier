@@ -8,14 +8,15 @@ const {
   default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  Browsers
 } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '5mb' }));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 7860;
 const SESSIONS_DIR = path.join(__dirname, 'sessions');
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
@@ -96,14 +97,17 @@ async function startSession(rawId) {
 
   try {
     const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-    const { version } = await fetchLatestBaileysVersion();
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`[Session ${sid}] Using WA v${version.join('.')} (isLatest=${isLatest})`);
 
     const sock = makeWASocket({
       version,
       auth: state,
       logger: pino({ level: 'silent' }),
       printQRInTerminal: false,
-      browser: ['WhatsVerifier Cloud', 'Chrome', '128.0.0'],
+      browser: Browsers.macOS('Desktop'),
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: undefined,
       syncFullHistory: false,
       markOnlineOnConnect: false
     });
